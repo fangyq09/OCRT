@@ -1,0 +1,34 @@
+[package]
+name = "OCRT"
+version = "0.2.0"
+edition = "2021"
+
+[dependencies]
+eframe = "0.33"
+egui = "0.33"
+egui_extras = { version = "0.33", features = ["image"] }
+anyhow = "1.0"
+image = "0.25"
+rfd = "0.15"
+tokio = { version = "1", features = ["full"] }
+dirs = "5.0"
+arboard = "3.4"
+serde = { version = "1.0", features = ["derive"] }
+toml = "0.8"
+confy = "0.6"
+shellexpand = "3.1"
+rusqlite = { version = "0.31", features = ["bundled"] }
+chrono = "0.4"
+directories = "5.0"
+
+[patch.crates-io]
+egui = { git = "https://github.com/fangyq09/egui-0.33.3-patch.git" }
+#egui = { path = "local_crates/egui-0.33.3" }
+
+[profile.release]
+opt-level = 3        # 最高级优化
+lto = "fat"          # 开启全代码增量优化 (Link Time Optimization)
+codegen-units = 1    # 牺牲编译速度换取更好的全局优化
+panic = "abort"      # 移除 panic 栈回溯信息，减小体积并提升性能
+strip = true         # 移除符号表，进一步压缩体积
+
