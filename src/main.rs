@@ -5,6 +5,7 @@ use rfd::FileDialog;
 //use std::process::Command;
 use rusqlite::{params, Connection};
 use std::os::unix::fs::PermissionsExt;
+use base64::Engine;
 mod ui_utils;
 
 
@@ -20,9 +21,10 @@ enum OcrState {
 pub struct OcrResources {
     pub cli_exe: std::path::PathBuf,      // llama-cli (用于翻译)
     pub mtmd_exe: std::path::PathBuf,     // llama-mtmd-cli (用于 OCR)
+		pub server_exe: std::path::PathBuf,
     pub text_model: std::path::PathBuf,   // Gemma-3 模型
     pub v_model: std::path::PathBuf,      // GLM-OCR 模型
-    pub mmproj: std::path::PathBuf,       // GLM-OCR 的视觉插件
+    pub v_mmproj: std::path::PathBuf,       // GLM-OCR 的视觉插件
 		pub ocr_prompt: String,
     pub trans_prompt: String,
 }
@@ -37,11 +39,14 @@ fn default_trans_prompt() -> String {
 struct AppConfig {
     cli_exe: String,
     mtmd_exe: String,
+		server_exe: String,
     text_model: String,
     v_model: String,
-    mmproj: String,
+    v_mmproj: String,
 		ocr_prompt: String,
     trans_prompt: String,
+		enable_server_mode: bool,
+		enable_chat_server_mode: bool,
 }
 
 impl Default for AppConfig {
@@ -49,11 +54,14 @@ impl Default for AppConfig {
 		Self {
 			cli_exe: "llama-cli".into(),
 			mtmd_exe: "llama-mtmd-cli".into(),
+			server_exe: "llama-server".into(),
 			text_model: "gemma-3-4b-it-Q4_K_M.gguf".into(),
 			v_model: "GLM-OCR-Q8_0.gguf".into(),
-			mmproj: "mmproj-GLM-OCR-Q8_0.gguf".into(),
+			v_mmproj: "mmproj-GLM-OCR-Q8_0.gguf".into(),
 			ocr_prompt: default_ocr_prompt(),
 			trans_prompt: default_trans_prompt(),
+			enable_server_mode: false,
+			enable_chat_server_mode: true,
 		}
 	}
 }
@@ -121,6 +129,9 @@ struct OCRTApp {
 	show_history: bool, 
 	history_items: Vec<HistoryEntry>,
 	preview_image: Option<(String, Vec<u8>)>,
+	ocr_server_process: Option<std::process::Child>,
+	// 新增：用于保持 AI 对话服务常驻的子进程句柄
+	chat_server_process: Option<std::process::Child>,
 }
 //初始化
 impl Default for OCRTApp {
@@ -130,6 +141,11 @@ impl Default for OCRTApp {
 			proj_dirs.data_dir().join("history.db")
 		} else {
 			std::path::PathBuf::from("history.db")
+		};
+		let server_process = if config.enable_server_mode {
+			Self::start_ocr_server(&config)
+		} else {
+			None
 		};
 		Self {
 			app_title: "OCR Tools".to_owned(),
@@ -146,6 +162,8 @@ impl Default for OCRTApp {
 			show_history: false,
 			history_items: Vec::new(),
 			preview_image: None,
+			ocr_server_process: server_process,
+			chat_server_process: None,
 		}
 	}
 }
@@ -330,6 +348,11 @@ impl OCRTApp {
             };
             if ui.add_enabled(!is_busy, egui::Button::new(btn_text).fill(btn_color)).clicked() {
                 self.is_chat_mode = !self.is_chat_mode;
+								if self.is_chat_mode {
+                    self.start_chat_server(None); // 开启对话模式时拉起服务
+                } else {
+                    self.stop_chat_server();  // 退出对话模式时释放服务
+                }
             }
 
             ui.separator(); // 添加分隔线
@@ -407,48 +430,13 @@ impl OCRTApp {
 					.auto_shrink([false; 2]) 
 					.show(ui, |ui| {
 						if self.is_chat_mode {
-							egui::Frame::group(ui.style()).show(ui, |ui| {
-								ui.heading("📂 可用模型列表 (~/.local/share/llama_models)");
-								ui.add_space(10.0);
-
-								let models = get_model_list();
-								if models.is_empty() {
-									ui.label(egui::RichText::new("未发现 .gguf 模型文件").color(egui::Color32::GRAY));
-								}
-
-								egui::ScrollArea::vertical().show(ui, |ui| {
-									for path in models {
-										let file_name = path.file_name()
-											.map(|f| f.to_string_lossy().to_string()) 
-											.unwrap_or_else(|| "未知模型".to_string());
-
-										ui.horizontal(|ui| {
-											ui.label(egui::RichText::new("🤖").size(18.0));
-											ui.vertical(|ui| {
-												ui.label(egui::RichText::new(&file_name).strong());
-												ui.label(egui::RichText::new(path.to_string_lossy()).small().weak());
-											});
-
-											ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-												if ui.button("🚀 启动").clicked() {
-													//let res = get_ocr_resources().unwrap();
-													//launch_in_terminal(&res.cli_exe.display().to_string(), &path);
-													match get_ocr_resources_from_config(&self.config) {
-														Ok(res) => {
-															launch_in_terminal(&res.cli_exe.display().to_string(), &path);
-														}
-														Err(e) => {
-															eprintln!("无法启动终端: {}", e);
-														}
-													}
-												}
-											});
-										});
-										ui.separator();
-									}
-								});
-							});
-
+							// ---  AI 对话模式面板 ---
+							//self.draw_chat_mode_panel(ui);
+							if self.config.enable_chat_server_mode {
+								self.draw_chat_mode_panel(ui);       // 网页 Server 模式
+							} else {
+								self.draw_chat_terminal_panel(ui);   // 终端 CLI 模型列表模式
+							}
 						} else if self.is_editing {
 							// --- 原始编辑模式逻辑 ---
 							let total_available = ui.available_height();
@@ -542,6 +530,123 @@ impl OCRTApp {
 			});
 	}
 }
+impl OCRTApp {
+	fn draw_chat_mode_panel(&mut self, ui: &mut egui::Ui) {
+		let mut model_changed_to: Option<String> = None;
+
+		let current_model_name = std::path::Path::new(&self.config.text_model)
+			.file_name()
+			.map(|f| f.to_string_lossy().to_string())
+			.unwrap_or_else(|| "未知模型".to_string());
+
+		egui::Frame::group(ui.style()).show(ui, |ui| {
+			ui.heading("🤖 AI 文本对话服务已就绪");
+			ui.add_space(15.0);
+
+			ui.horizontal(|ui| {
+				ui.label(egui::RichText::new("当前对话模型:").strong());
+				
+				egui::ComboBox::from_id_salt("chat_model_select")
+					.selected_text(egui::RichText::new(&current_model_name).color(egui::Color32::LIGHT_BLUE))
+					.show_ui(ui, |ui| {
+						let models = get_model_list();
+						for path in models {
+							let name = path.file_name()
+								.map(|f| f.to_string_lossy().to_string())
+								.unwrap_or_default();
+							let full_path_str = path.display().to_string();
+							
+							let is_selected = self.config.text_model == full_path_str;
+							if ui.selectable_label(is_selected, &name).clicked() {
+								if !is_selected {
+									model_changed_to = Some(full_path_str);
+								}
+							}
+						}
+					});
+
+				if ui.button("📁 浏览...").clicked() {
+					let home = dirs::home_dir().unwrap_or_default();
+					let default_model_dir = home.join(".local/share/llama_models");
+					if let Some(path) = rfd::FileDialog::new()
+						.set_directory(&default_model_dir)
+						.add_filter("GGUF 模型", &["gguf"])
+						.pick_file() 
+					{
+						model_changed_to = Some(path.display().to_string());
+					}
+				}
+			});
+
+			ui.add_space(10.0);
+			ui.label("后端常驻服务运行中，端口: 8081");
+			ui.add_space(15.0);
+
+			ui.horizontal(|ui| {
+				ui.label("请点击下方按钮或链接在浏览器中开始聊天：");
+			});
+			ui.add_space(10.0);
+
+			if ui.button("🌐 在浏览器中打开聊天页面 (http://127.0.0.1:8081)").clicked() {
+				let _ = std::process::Command::new("xdg-open")
+					.arg("http://127.0.0.1:8081")
+					.spawn();
+			}
+		});
+
+		// --- 临时切换模型，不污染全局配置持久化 ---
+		if let Some(new_model_path) = model_changed_to {
+			println!("🔄 临时切换对话模型: {}", new_model_path);
+			
+			// 仅仅是关闭旧服务，然后把新路径传进去启动
+			self.stop_chat_server();
+			self.start_chat_server(Some(&new_model_path));
+		}
+	}
+}
+impl OCRTApp {
+	fn draw_chat_terminal_panel(&self, ui: &mut egui::Ui) {
+		egui::Frame::group(ui.style()).show(ui, |ui| {
+			ui.heading("📂 可用模型列表 (~/.local/share/llama_models)");
+			ui.add_space(10.0);
+
+			let models = get_model_list();
+			if models.is_empty() {
+				ui.label(egui::RichText::new("未发现 .gguf 模型文件").color(egui::Color32::GRAY));
+			}
+
+			egui::ScrollArea::vertical().show(ui, |ui| {
+				for path in models {
+					let file_name = path.file_name()
+						.map(|f| f.to_string_lossy().to_string()) 
+						.unwrap_or_else(|| "未知模型".to_string());
+
+					ui.horizontal(|ui| {
+						ui.label(egui::RichText::new("🤖").size(18.0));
+						ui.vertical(|ui| {
+							ui.label(egui::RichText::new(&file_name).strong());
+							ui.label(egui::RichText::new(path.to_string_lossy()).small().weak());
+						});
+
+						ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+							if ui.button("🚀 启动").clicked() {
+								match get_ocr_resources_from_config(&self.config) {
+									Ok(res) => {
+										launch_in_terminal(&res.cli_exe.display().to_string(), &path);
+									}
+									Err(e) => {
+										eprintln!("无法启动终端: {}", e);
+									}
+								}
+							}
+						});
+					});
+					ui.separator();
+				}
+			});
+		});
+	}
+}
 
 impl OCRTApp {
 	fn trigger_ocr(&mut self, ctx: egui::Context, path_str: String) {
@@ -559,7 +664,12 @@ impl OCRTApp {
 		// 4. 清空翻译内容
     if let Ok(mut t) = self.translated_content.lock() { *t = String::new(); }
 		// 5. 启动异步任务
-		self.run_ocr_task(ctx, target_path);
+		//self.run_ocr_task(ctx, target_path);
+		if self.config.enable_server_mode {
+			self.run_ocr_task_server(ctx, target_path);
+		} else {
+			self.run_ocr_task(ctx, target_path);
+		}
 	}
 }
 
@@ -589,7 +699,7 @@ impl OCRTApp {
 					//.env("GGML_VK_VISIBLE_DEVICES", "0")
 					.arg("-m").arg(&res.v_model)                    // 使用视觉大模型
 					.arg("--jinja")
-					.arg("--mmproj").arg(&res.mmproj)                // 使用视觉适配器
+					.arg("--mmproj").arg(&res.v_mmproj)                // 使用视觉适配器
 					.arg("--image").arg(&img_path)
 					//.arg("-ngl").arg("100")                          // 尝试全量卸载到 GPU
 					.arg("--temp").arg("0.1")       
@@ -632,6 +742,185 @@ impl OCRTApp {
 		});
 	}
 }
+//调用llama-server
+impl OCRTApp {
+	fn run_ocr_task_server(&self, ctx: egui::Context, img_path: String) {
+		let content_ptr = self.ocr_content.clone();
+		let state_ptr = self.state.clone();
+		let config_for_thread = self.config.clone();
+		let db_p = self.db_path.clone();
+
+		if let Ok(mut s) = state_ptr.lock() { *s = OcrState::Initializing; }
+
+		std::thread::spawn(move || {
+			let result = (|| -> anyhow::Result<String> {
+				if let Ok(mut s) = state_ptr.lock() { *s = OcrState::Processing; }
+
+				let image_bytes = std::fs::read(&img_path)?;
+				let base64_image = base64::engine::general_purpose::STANDARD.encode(&image_bytes);
+
+				//let client = reqwest::blocking::Client::new();
+				// 显式设置一个较大的超时时间（如 300 秒）
+				let client = reqwest::blocking::Client::builder()
+					.timeout(std::time::Duration::from_secs(300))
+					.build()?;
+				
+				// 使用 llama-server 标准的 OpenAI 兼容 Chat 接口格式
+				let payload = serde_json::json!({
+					"messages": [
+						{
+							"role": "user",
+							"content": [
+								{
+									"type": "text",
+									"text": config_for_thread.ocr_prompt
+								},
+								{
+									"type": "image_url",
+									"image_url": {
+										"url": format!("data:image/jpeg;base64,{}", base64_image)
+									}
+								}
+							]
+						}
+					],
+					"temperature": 0.1,
+					"max_tokens": 4096
+				});
+
+				// 注意：接口变更为 /v1/chat/completions
+				let response = client.post("http://127.0.0.1:8080/v1/chat/completions")
+					.json(&payload)
+					.send()?;
+
+				if !response.status().is_success() {
+					let err_text = response.text().unwrap_or_default();
+					return Err(anyhow::anyhow!("OCR 服务请求失败: {}", err_text));
+				}
+
+				let json: serde_json::Value = response.json()?;
+				
+				// 解析 OpenAI 格式的返回结果：choices[0].message.content
+				let raw = json["choices"][0]["message"]["content"]
+					.as_str()
+					.unwrap_or("")
+					.trim()
+					.to_string();
+
+				if raw.is_empty() {
+					return Err(anyhow::anyhow!("模型完全没有输出任何内容"));
+				}
+
+				Ok(raw)
+			})();
+
+			if let (Ok(mut c), Ok(mut s)) = (content_ptr.lock(), state_ptr.lock()) {
+				match result {
+					Ok(text) => {
+						*c = text.clone();
+						*s = OcrState::Success; 
+						let _ = save_history_to_db_static(&db_p, &text, "", &img_path);
+					},
+					Err(e) => {
+						*c = format!("❌ 错误: {}", e);
+						*s = OcrState::Failure;
+					}
+				}
+			}
+
+			ctx.request_repaint();
+		});
+	}
+}
+//启动OCR后台服务
+impl OCRTApp {
+    fn start_ocr_server(config: &AppConfig) -> Option<std::process::Child> {
+        let res = get_ocr_resources_from_config(config).ok()?;
+
+        println!("🚀 正在后台启动 OCR 常驻服务 (llama-server)...");
+        let child = std::process::Command::new(&res.server_exe)
+            .arg("-m").arg(&res.v_model)
+            .arg("--mmproj").arg(&res.v_mmproj)
+            .arg("--port").arg("8080")
+            .arg("-c").arg("16384")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+						//.stdout(std::process::Stdio::inherit())
+            //.stderr(std::process::Stdio::inherit())
+            .spawn()
+            .ok()?;
+
+        std::thread::sleep(std::time::Duration::from_secs(2));
+        Some(child)
+    }
+
+    fn stop_ocr_server(&mut self) {
+        if let Some(mut child) = self.ocr_server_process.take() {
+            println!("🛑 正在关闭后台 OCR 服务进程...");
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+//启动server聊天后台服务
+impl OCRTApp {
+    fn start_chat_server(&mut self, custom_model_path: Option<&str>) {
+        if self.chat_server_process.is_some() { return; }
+        let res = match get_ocr_resources_from_config(&self.config) {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("⚠️ 无法启动对话服务，资源解析失败: {}", e);
+                return;
+            }
+        };
+				// 1. 确定原始的模型字符串（自定义的或者配置默认的）
+        let raw_model_str = custom_model_path.unwrap_or(&self.config.text_model);
+        // 2. 通过 resolve_model_path 自动把文件名或简写转为系统的绝对路径
+        let resolved_model_path = resolve_model_path(raw_model_str);
+
+        if !resolved_model_path.exists() {
+            eprintln!("❌ 对话模型文件未找到: {:?}", resolved_model_path);
+            return;
+        }
+        println!("🚀 正在后台启动 AI 对话服务 (llama-server) [文本模型]...");
+        let child = std::process::Command::new(&res.server_exe)
+            //.arg("-m").arg(&res.text_model) // 使用 text_model
+						.arg("-m").arg(&resolved_model_path) // 使用动态决定的模型路径
+            .arg("--port").arg("8081")      // 使用 8081 端口，避免与 OCR 的 8080 冲突
+            .arg("-c").arg("16384")
+            .arg("-ngl").arg("100")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            //.stdout(std::process::Stdio::inherit())
+            //.stderr(std::process::Stdio::inherit())
+            .spawn();
+
+        match child {
+            Ok(process) => {
+                self.chat_server_process = Some(process);
+                std::thread::sleep(std::time::Duration::from_secs(1)); // 预热等待
+            }
+            Err(e) => {
+                eprintln!("❌ 启动 chat server 进程失败: {}", e);
+            }
+        }
+    }
+
+    fn stop_chat_server(&mut self) {
+        if let Some(mut child) = self.chat_server_process.take() {
+            println!("🛑 正在关闭 AI 对话服务进程...");
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+// 确保程序退出时自动释放后台服务
+impl Drop for OCRTApp {
+    fn drop(&mut self) {
+        self.stop_ocr_server();
+				self.stop_chat_server();
+    }
+}
 //翻译
 impl OCRTApp {
 	fn run_translate_task(&self, ctx: egui::Context, source_text: String) {
@@ -642,13 +931,8 @@ impl OCRTApp {
 		if let Ok(mut s) = state_ptr.lock() { *s = OcrState::Translating; }
 		std::thread::spawn(move || {
 			let result = (|| -> anyhow::Result<String> {
-				//let res = get_ocr_resources()?;
 				let res = get_ocr_resources_from_config(&config_for_thread)?;
 
-				//let prompt_text = format!(
-				//	"Translate this Chinese text into English, do not solve it, formatted with LaTeX for mathematical expressions: \"{}\"", 
-				//	source_text.replace('\n', " ")
-				//);
 				let prompt_text = format!(
 					"{} \"{}\"", 
 					res.trans_prompt, 
@@ -834,6 +1118,18 @@ impl OCRTApp {
 				}
 			});
 
+			ui.horizontal(|ui| {
+				ui.label("后台 CLI:");
+				ui.text_edit_singleline(&mut self.config.server_exe);
+				if ui.button("📁").clicked() {
+					if let Some(path) = rfd::FileDialog::new()
+						.set_directory(&default_bin_dir)
+							.pick_file() {
+								self.config.server_exe = path.display().to_string();
+					}
+				}
+			});
+
 			ui.separator();
 			ui.heading("模型配置");
 
@@ -863,12 +1159,12 @@ impl OCRTApp {
 
 			ui.horizontal(|ui| {
 				ui.label("视觉插件:");
-				ui.text_edit_singleline(&mut self.config.mmproj);
+				ui.text_edit_singleline(&mut self.config.v_mmproj);
 				if ui.button("📁").clicked() {
 					if let Some(path) = rfd::FileDialog::new()
 						.set_directory(&default_model_dir)
 							.pick_file() {
-								self.config.mmproj = path.display().to_string();
+								self.config.v_mmproj = path.display().to_string();
 					}
 				}
 			});
@@ -888,7 +1184,23 @@ impl OCRTApp {
 				ui.text_edit_singleline(&mut self.config.trans_prompt);
 			});
 
-			ui.add_space(10.0);
+			ui.separator();
+			ui.heading("运行模式配置");
+
+			ui.horizontal(|ui| {
+				ui.label("OCR 模式:");
+				ui.checkbox(&mut self.config.enable_server_mode, "启用 OCR 常驻后台 Server 模式");
+			});
+
+			ui.add_space(5.0);
+
+			ui.horizontal(|ui| {
+				ui.label("AI对话模式:");
+				ui.checkbox(&mut self.config.enable_chat_server_mode, "启用网页版 Server 对话");
+			});
+
+			ui.separator();
+			ui.add_space(15.0);
 			ui.vertical_centered(|ui| {
 				if ui.button("保存并应用").clicked() {
 					let _ = confy::store("ocr-tools", "config", &self.config);
@@ -898,6 +1210,18 @@ impl OCRTApp {
 		});
 		if save_clicked {
 			self.show_settings = false;
+			// === 根据开关状态实时动态启停后台 Server 模型 ===
+			if self.config.enable_server_mode {
+				// 如果用户勾选了 Server 模式，且当前后台还没启动，则立即拉起加载
+				if self.ocr_server_process.is_none() {
+					self.ocr_server_process = Self::start_ocr_server(&self.config);
+				}
+			} else {
+				// 如果用户取消了勾选，且当前后台正在运行，则立即杀死进程释放模型
+				if self.ocr_server_process.is_some() {
+					self.stop_ocr_server();
+				}
+			}
 		} else {
 			self.show_settings = is_open;
 		}
@@ -908,20 +1232,28 @@ fn get_ocr_resources_from_config(config: &AppConfig) -> anyhow::Result<OcrResour
     let res = OcrResources {
         cli_exe: resolve_executable(&config.cli_exe),
         mtmd_exe: resolve_executable(&config.mtmd_exe),
+				server_exe: resolve_executable(&config.server_exe),
         text_model: resolve_model_path(&config.text_model),
         v_model: resolve_model_path(&config.v_model),
-        mmproj: resolve_model_path(&config.mmproj),
+        v_mmproj: resolve_model_path(&config.v_mmproj),
 				ocr_prompt: config.ocr_prompt.clone(),
 				trans_prompt: config.trans_prompt.clone(),
     };
 
     // 2. 统一物理存在性检查
+    //let check_list = [
+    //    (&res.cli_exe, "文本引擎 CLI"),
+    //    (&res.mtmd_exe, "视觉引擎 CLI"),
+		//		(&res.server_exe, "Server 引擎"),
+    //    (&res.text_model, "翻译模型"),
+    //    (&res.v_model, "OCR 模型"),
+    //    (&res.v_mmproj, "视觉插件 (mmproj)"),
+    //];
+		// OCR 只需要校验视觉相关的组件
     let check_list = [
-        (&res.cli_exe, "文本引擎 CLI"),
         (&res.mtmd_exe, "视觉引擎 CLI"),
-        (&res.text_model, "翻译模型"),
         (&res.v_model, "OCR 模型"),
-        (&res.mmproj, "视觉插件 (mmproj)"),
+        (&res.v_mmproj, "视觉插件 (mmproj)"),
     ];
 
     for (path, name) in check_list {
