@@ -1,5 +1,7 @@
 use eframe::egui;
 use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 use image::GenericImageView;
 use rfd::FileDialog;
 //use std::process::Command;
@@ -70,7 +72,7 @@ struct HistoryEntry {
     id: i32,
     time: String,
     ocr_text: String,
-    image_data: Vec<u8>,
+    image_data: Arc<[u8]>,
 }
 
 fn setup_fonts(ctx: &egui::Context) {
@@ -128,10 +130,14 @@ struct OCRTApp {
 	db_path: std::path::PathBuf,
 	show_history: bool, 
 	history_items: Vec<HistoryEntry>,
-	preview_image: Option<(String, Vec<u8>)>,
+	preview_image: Option<(String, Arc<[u8]>)>,
 	ocr_server_process: Option<std::process::Child>,
 	// 新增：用于保持 AI 对话服务常驻的子进程句柄
 	chat_server_process: Option<std::process::Child>,
+	// 对话服务是否已加载完成（后台线程轮询 /health 后置位）
+	chat_ready: Arc<AtomicBool>,
+	// 历史记录异步加载的接收端
+	history_rx: Option<std::sync::mpsc::Receiver<Vec<HistoryEntry>>>,
 }
 //初始化
 impl Default for OCRTApp {
@@ -164,6 +170,8 @@ impl Default for OCRTApp {
 			preview_image: None,
 			ocr_server_process: server_process,
 			chat_server_process: None,
+			chat_ready: Arc::new(AtomicBool::new(false)),
+			history_rx: None,
 		}
 	}
 }
@@ -171,6 +179,14 @@ impl Default for OCRTApp {
 impl eframe::App for OCRTApp {
 	fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
 		// 调用独立出来的标题栏函数
+		// 轮询后台线程加载好的历史记录
+		if let Some(rx) = &self.history_rx {
+			if let Ok(items) = rx.try_recv() {
+				self.history_items = items;
+				self.history_rx = None;
+			}
+		}
+
 		self.render_custom_title_bar(ctx);
 
 		// 渲染主体内容
@@ -215,7 +231,7 @@ impl OCRTApp {
 					let path_str = path.display().to_string();
 					let lower = path_str.to_lowercase();
 					if [".png", ".jpg", ".jpeg", ".webp"].iter().any(|ext| lower.ends_with(ext)) {
-						self.trigger_ocr(ctx.clone(), path_str);
+						self.trigger_ocr(ctx.clone(), OcrSource::File(path_str));
 						break;
 					}
 				}
@@ -250,7 +266,7 @@ impl OCRTApp {
                     .add_filter("图片文件", &["png", "jpg", "jpeg", "bmp", "webp"])
                     .pick_file() 
                 {
-                    self.trigger_ocr(ctx.clone(), path.display().to_string());
+                    self.trigger_ocr(ctx.clone(), OcrSource::File(path.display().to_string()));
                 }
             }
 
@@ -266,22 +282,8 @@ impl OCRTApp {
             if ui.add_enabled(can_pick, paste_btn).clicked() {
                 if let Ok(mut cb) = arboard::Clipboard::new() {
                     if let Ok(image) = cb.get_image() {
-                        let temp_path = std::env::temp_dir().join("ocr_manual_paste.png");
-                        let save_result = image::save_buffer(
-                            &temp_path,
-                            &image.bytes,
-                            image.width as u32,
-                            image.height as u32, 
-                            image::ColorType::Rgba8,
-                        );
-                        if let Err(e) = save_result {
-                            eprintln!("粘贴图片保存失败: {}", e);
-                            if let Ok(mut state) = self.state.lock() {
-                                *state = OcrState::Failure;
-                            }
-                        } else {
-                            self.trigger_ocr(ctx.clone(), temp_path.display().to_string());
-                        }
+                        // 落盘/缩放交给后台线程，这里只把剪贴板数据交出去
+                        self.trigger_ocr(ctx.clone(), OcrSource::Pasted(image));
                     } 
                 }
             }
@@ -359,8 +361,10 @@ impl OCRTApp {
 
             // 8. 历史记录
             if ui.button("历史记录").clicked() {
-                self.load_history();
                 self.show_history = !self.show_history;
+                if self.show_history {
+                    self.load_history_async(ctx); // 只在打开时异步加载
+                }
             }
 
 
@@ -540,7 +544,16 @@ impl OCRTApp {
 			.unwrap_or_else(|| "未知模型".to_string());
 
 		egui::Frame::group(ui.style()).show(ui, |ui| {
-			ui.heading("🤖 AI 文本对话服务已就绪");
+			if self.chat_server_process.is_none() {
+				ui.heading("❌ 对话服务未启动（请检查模型路径或 CLI 配置）");
+			} else if self.chat_ready.load(Ordering::SeqCst) {
+				ui.heading("🤖 AI 文本对话服务已就绪");
+			} else {
+				ui.horizontal(|ui| {
+					ui.add(egui::Spinner::new());
+					ui.heading("模型加载中…");
+				});
+			}
 			ui.add_space(15.0);
 
 			ui.horizontal(|ui| {
@@ -648,189 +661,193 @@ impl OCRTApp {
 	}
 }
 
-impl OCRTApp {
-	fn trigger_ocr(&mut self, ctx: egui::Context, path_str: String) {
-		// 0. 预处理：生成缩放后的临时图片路径（失败则回退到原图）
-    let target_path = preprocess_image(&path_str).unwrap_or_else(|_| path_str.clone());
-
-		// 1. 更新路径
-		if let Ok(mut p) = self.selected_path.lock() { 
-			*p = path_str.clone(); 
-		}
-		// 2. 状态切换
-		if let Ok(mut s) = self.state.lock() { *s = OcrState::Initializing; }
-		// 3. 清空内容
-		if let Ok(mut c) = self.ocr_content.lock() { c.clear(); }
-		// 4. 清空翻译内容
-    if let Ok(mut t) = self.translated_content.lock() { *t = String::new(); }
-		// 5. 启动异步任务
-		//self.run_ocr_task(ctx, target_path);
-		if self.config.enable_server_mode {
-			self.run_ocr_task_server(ctx, target_path);
-		} else {
-			self.run_ocr_task(ctx, target_path);
-		}
-	}
+// OCR 输入来源：文件路径，或剪贴板里的原始图像数据
+enum OcrSource {
+    File(String),
+    Pasted(arboard::ImageData<'static>),
 }
 
-//调用llama-mtmd-cli
-impl OCRTApp {
-	fn run_ocr_task(&self, ctx: egui::Context, img_path: String) {
-		let content_ptr = self.ocr_content.clone();
-		let state_ptr = self.state.clone();
-		let config_for_thread = self.config.clone();
-		let db_p = self.db_path.clone();
-
-		if let Ok(mut s) = state_ptr.lock() { *s = OcrState::Initializing; }
-
-		std::thread::spawn(move || {
-			let result = (|| -> anyhow::Result<String> {
-
-				// 1. 获取统一的资源路径
-				let res = get_ocr_resources_from_config(&config_for_thread)?;
-
-				if let Ok(mut s) = state_ptr.lock() { *s = OcrState::Processing; }
-
-				// 建议增加一个更明确的系统提示
-				//let prompt = "Extract text and use LaTeX for all mathematical formulas from the image.";
-
-				// 2. 调用新编译的 mtmd 引擎
-				let output = std::process::Command::new(&res.mtmd_exe) // 使用 mtmd_exe
-					//.env("GGML_VK_VISIBLE_DEVICES", "0")
-					.arg("-m").arg(&res.v_model)                    // 使用视觉大模型
-					.arg("--jinja")
-					.arg("--mmproj").arg(&res.v_mmproj)                // 使用视觉适配器
-					.arg("--image").arg(&img_path)
-					//.arg("-ngl").arg("100")                          // 尝试全量卸载到 GPU
-					.arg("--temp").arg("0.1")       
-					//.arg("-p").arg(prompt) 
-					.arg("-p").arg(&res.ocr_prompt)
-					.arg("-n").arg("4096")
-					.arg("-c").arg("16384")
-					.stderr(std::process::Stdio::piped())
-					.output()?; // 阻塞等待 OCR 结束
-
-				if !output.status.success() {
-					let err_msg = String::from_utf8_lossy(&output.stderr);
-					return Err(anyhow::anyhow!("OCR 引擎执行失败: {}", err_msg));
-				}
-
-				let raw = String::from_utf8_lossy(&output.stdout).trim().to_string();
-
-				if raw.is_empty() {
-					return Err(anyhow::anyhow!("模型完全没有输出任何内容"));
-				}
-
-				Ok(raw)
-			})();
-
-			if let (Ok(mut c), Ok(mut s)) = (content_ptr.lock(), state_ptr.lock()) {
-				match result {
-					Ok(text) => {
-						*c = text.clone();
-						*s = OcrState::Success; 
-						let _ = save_history_to_db_static(&db_p, &text, "", &img_path);
-					},
-					Err(e) => {
-						*c = format!("❌ 错误: {}", e);
-						*s = OcrState::Failure;
-					}
-				}
-			}
-
-			ctx.request_repaint();
-		});
-	}
+// 轮询 llama-server 的 /health，直到模型加载完成（返回 true）或超时（返回 false）
+// 只能在后台线程里调用，会阻塞当前线程
+fn wait_for_server(port: u16, timeout: Duration) -> bool {
+    let Ok(client) = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(2))
+        .build() else { return false };
+    let url = format!("http://127.0.0.1:{}/health", port);
+    let start = std::time::Instant::now();
+    while start.elapsed() < timeout {
+        if client.get(&url)
+            .send()
+            .map(|r| r.status().is_success())
+            .unwrap_or(false)
+        {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(300));
+    }
+    false
 }
-//调用llama-server
+
+// 重活：粘贴图落盘（PNG 编码）+ 大图缩放。返回 (显示用路径, 实际送去识别的路径)
+fn prepare_image(src: OcrSource) -> anyhow::Result<(String, String)> {
+    let display = match src {
+        OcrSource::File(p) => p,
+        OcrSource::Pasted(img) => {
+            let temp = std::env::temp_dir().join("ocr_manual_paste.png");
+            image::save_buffer(
+                &temp,
+                &img.bytes,
+                img.width as u32,
+                img.height as u32,
+                image::ColorType::Rgba8,
+            )?;
+            temp.display().to_string()
+        }
+    };
+    // 预处理失败则回退到原图
+    let ocr_input = preprocess_image(&display).unwrap_or_else(|_| display.clone());
+    Ok((display, ocr_input))
+}
+
 impl OCRTApp {
-	fn run_ocr_task_server(&self, ctx: egui::Context, img_path: String) {
-		let content_ptr = self.ocr_content.clone();
-		let state_ptr = self.state.clone();
-		let config_for_thread = self.config.clone();
-		let db_p = self.db_path.clone();
+    // UI 线程只做“瞬间完成”的事：改状态、清内容；其余全部丢到后台线程
+    fn trigger_ocr(&mut self, ctx: egui::Context, src: OcrSource) {
+        if let OcrSource::File(p) = &src {
+            if let Ok(mut sp) = self.selected_path.lock() { *sp = p.clone(); }
+        }
+        if let Ok(mut s) = self.state.lock() { *s = OcrState::Initializing; }
+        if let Ok(mut c) = self.ocr_content.lock() { c.clear(); }
+        if let Ok(mut t) = self.translated_content.lock() { t.clear(); }
 
-		if let Ok(mut s) = state_ptr.lock() { *s = OcrState::Initializing; }
+        let content_ptr = self.ocr_content.clone();
+        let state_ptr = self.state.clone();
+        let path_ptr = self.selected_path.clone();
+        let config = self.config.clone();
+        let db_p = self.db_path.clone();
+        let server_running = self.ocr_server_process.is_some();
 
-		std::thread::spawn(move || {
-			let result = (|| -> anyhow::Result<String> {
-				if let Ok(mut s) = state_ptr.lock() { *s = OcrState::Processing; }
+        std::thread::spawn(move || {
+            let mut img_path = String::new();
 
-				let image_bytes = std::fs::read(&img_path)?;
-				let base64_image = base64::engine::general_purpose::STANDARD.encode(&image_bytes);
+            let result = (|| -> anyhow::Result<String> {
+                // 1. 落盘 / 缩放（原来在 UI 线程，现在在这里）
+                let (display, ocr_input) = prepare_image(src)?;
+                if let Ok(mut sp) = path_ptr.lock() { *sp = display; }
+                img_path = ocr_input.clone();
+                ctx.request_repaint();
 
-				//let client = reqwest::blocking::Client::new();
-				// 显式设置一个较大的超时时间（如 300 秒）
-				let client = reqwest::blocking::Client::builder()
-					.timeout(std::time::Duration::from_secs(300))
-					.build()?;
-				
-				// 使用 llama-server 标准的 OpenAI 兼容 Chat 接口格式
-				let payload = serde_json::json!({
-					"messages": [
-						{
-							"role": "user",
-							"content": [
-								{
-									"type": "text",
-									"text": config_for_thread.ocr_prompt
-								},
-								{
-									"type": "image_url",
-									"image_url": {
-										"url": format!("data:image/jpeg;base64,{}", base64_image)
-									}
-								}
-							]
-						}
-					],
-					"temperature": 0.1,
-					"max_tokens": 4096
-				});
+                // 2. 按模式识别
+                if config.enable_server_mode {
+                    if !server_running {
+                        anyhow::bail!("OCR 常驻服务未运行，请检查设置里的 Server 路径与模型");
+                    }
+                    // 此时状态仍为 Initializing（状态栏显示“正在唤醒引擎...”）
+                    if !wait_for_server(8080, Duration::from_secs(120)) {
+                        anyhow::bail!("OCR 服务启动超时（120 秒内模型未加载完成）");
+                    }
+                    if let Ok(mut s) = state_ptr.lock() { *s = OcrState::Processing; }
+                    ctx.request_repaint();
+                    ocr_via_server(&config, &ocr_input)
+                } else {
+                    let res = get_ocr_resources_from_config(&config)?;
+                    if let Ok(mut s) = state_ptr.lock() { *s = OcrState::Processing; }
+                    ctx.request_repaint();
+                    ocr_via_cli(&res, &ocr_input)
+                }
+            })();
 
-				// 注意：接口变更为 /v1/chat/completions
-				let response = client.post("http://127.0.0.1:8080/v1/chat/completions")
-					.json(&payload)
-					.send()?;
+            if let (Ok(mut c), Ok(mut s)) = (content_ptr.lock(), state_ptr.lock()) {
+                match result {
+                    Ok(text) => {
+                        *c = text.clone();
+                        *s = OcrState::Success;
+                        let _ = save_history_to_db_static(&db_p, &text, "", &img_path);
+                    }
+                    Err(e) => {
+                        *c = format!("❌ 错误: {}", e);
+                        *s = OcrState::Failure;
+                    }
+                }
+            }
+            ctx.request_repaint();
+        });
+    }
+}
 
-				if !response.status().is_success() {
-					let err_text = response.text().unwrap_or_default();
-					return Err(anyhow::anyhow!("OCR 服务请求失败: {}", err_text));
-				}
+// 调用 llama-mtmd-cli（每次都重新加载模型）
+fn ocr_via_cli(res: &OcrResources, img_path: &str) -> anyhow::Result<String> {
+    let output = std::process::Command::new(&res.mtmd_exe)
+        //.env("GGML_VK_VISIBLE_DEVICES", "0")
+        .arg("-m").arg(&res.v_model)
+        .arg("--jinja")
+        .arg("--mmproj").arg(&res.v_mmproj)
+        .arg("--image").arg(img_path)
+        //.arg("-ngl").arg("100")
+        .arg("--temp").arg("0.1")
+        .arg("-p").arg(&res.ocr_prompt)
+        .arg("-n").arg("4096")
+        .arg("-c").arg("8192")
+        .stderr(std::process::Stdio::piped())
+        .output()?; // 阻塞等待 OCR 结束（在后台线程里，不影响界面）
 
-				let json: serde_json::Value = response.json()?;
-				
-				// 解析 OpenAI 格式的返回结果：choices[0].message.content
-				let raw = json["choices"][0]["message"]["content"]
-					.as_str()
-					.unwrap_or("")
-					.trim()
-					.to_string();
+    if !output.status.success() {
+        let err_msg = String::from_utf8_lossy(&output.stderr);
+        return Err(anyhow::anyhow!("OCR 引擎执行失败: {}", err_msg));
+    }
 
-				if raw.is_empty() {
-					return Err(anyhow::anyhow!("模型完全没有输出任何内容"));
-				}
+    let raw = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if raw.is_empty() {
+        return Err(anyhow::anyhow!("模型完全没有输出任何内容"));
+    }
+    Ok(raw)
+}
 
-				Ok(raw)
-			})();
+// 调用常驻的 llama-server（OpenAI 兼容接口）
+fn ocr_via_server(config: &AppConfig, img_path: &str) -> anyhow::Result<String> {
+    let image_bytes = std::fs::read(img_path)?;
+    let base64_image = base64::engine::general_purpose::STANDARD.encode(&image_bytes);
 
-			if let (Ok(mut c), Ok(mut s)) = (content_ptr.lock(), state_ptr.lock()) {
-				match result {
-					Ok(text) => {
-						*c = text.clone();
-						*s = OcrState::Success; 
-						let _ = save_history_to_db_static(&db_p, &text, "", &img_path);
-					},
-					Err(e) => {
-						*c = format!("❌ 错误: {}", e);
-						*s = OcrState::Failure;
-					}
-				}
-			}
+    let client = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(300))
+        .build()?;
 
-			ctx.request_repaint();
-		});
-	}
+    let payload = serde_json::json!({
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    { "type": "text", "text": config.ocr_prompt },
+                    {
+                        "type": "image_url",
+                        "image_url": { "url": format!("data:image/jpeg;base64,{}", base64_image) }
+                    }
+                ]
+            }
+        ],
+        "temperature": 0.1,
+        "max_tokens": 4096
+    });
+
+    let response = client.post("http://127.0.0.1:8080/v1/chat/completions")
+        .json(&payload)
+        .send()?;
+
+    if !response.status().is_success() {
+        let err_text = response.text().unwrap_or_default();
+        return Err(anyhow::anyhow!("OCR 服务请求失败: {}", err_text));
+    }
+
+    let json: serde_json::Value = response.json()?;
+    let raw = json["choices"][0]["message"]["content"]
+        .as_str()
+        .unwrap_or("")
+        .trim()
+        .to_string();
+
+    if raw.is_empty() {
+        return Err(anyhow::anyhow!("模型完全没有输出任何内容"));
+    }
+    Ok(raw)
 }
 //启动OCR后台服务
 impl OCRTApp {
@@ -842,15 +859,16 @@ impl OCRTApp {
             .arg("-m").arg(&res.v_model)
             .arg("--mmproj").arg(&res.v_mmproj)
             .arg("--port").arg("8080")
-            .arg("-c").arg("16384")
+						.arg("-n").arg("4096")
+						.arg("-c").arg("8192")
+						.arg("--reasoning").arg("off")
+            .arg("--no-webui")
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
-						//.stdout(std::process::Stdio::inherit())
-            //.stderr(std::process::Stdio::inherit())
             .spawn()
             .ok()?;
 
-        std::thread::sleep(std::time::Duration::from_secs(2));
+        // 不再在 UI 线程上 sleep；是否就绪由 OCR 工作线程轮询 /health 判断
         Some(child)
     }
 
@@ -888,17 +906,23 @@ impl OCRTApp {
 						.arg("-m").arg(&resolved_model_path) // 使用动态决定的模型路径
             .arg("--port").arg("8081")      // 使用 8081 端口，避免与 OCR 的 8080 冲突
             .arg("-c").arg("16384")
-            .arg("-ngl").arg("100")
+            //.arg("-ngl").arg("100")
+						.arg("--reasoning").arg("off")
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
-            //.stdout(std::process::Stdio::inherit())
-            //.stderr(std::process::Stdio::inherit())
             .spawn();
 
         match child {
             Ok(process) => {
                 self.chat_server_process = Some(process);
-                std::thread::sleep(std::time::Duration::from_secs(1)); // 预热等待
+                // 不再 sleep：后台线程轮询 /health，就绪后置位 chat_ready
+                self.chat_ready.store(false, Ordering::SeqCst);
+                let ready = self.chat_ready.clone();
+                std::thread::spawn(move || {
+                    if wait_for_server(8081, Duration::from_secs(120)) {
+                        ready.store(true, Ordering::SeqCst);
+                    }
+                });
             }
             Err(e) => {
                 eprintln!("❌ 启动 chat server 进程失败: {}", e);
@@ -921,90 +945,89 @@ impl Drop for OCRTApp {
 				self.stop_chat_server();
     }
 }
-//翻译
+//翻译（一次性调用 llama-cli）
 impl OCRTApp {
-	fn run_translate_task(&self, ctx: egui::Context, source_text: String) {
-		let trans_ptr = self.translated_content.clone();
-		let state_ptr = self.state.clone();
-		let config_for_thread = self.config.clone();
+    fn run_translate_task(&self, ctx: egui::Context, source_text: String) {
+        let trans_ptr = self.translated_content.clone();
+        let state_ptr = self.state.clone();
+        let config = self.config.clone();
 
-		if let Ok(mut s) = state_ptr.lock() { *s = OcrState::Translating; }
-		std::thread::spawn(move || {
-			let result = (|| -> anyhow::Result<String> {
-				let res = get_ocr_resources_from_config(&config_for_thread)?;
+        if let Ok(mut s) = state_ptr.lock() { *s = OcrState::Translating; }
+        std::thread::spawn(move || {
+            let result = (|| -> anyhow::Result<String> {
+                let res = get_ocr_resources_from_config(&config)?;
 
-				let prompt_text = format!(
-					"{} \"{}\"", 
-					res.trans_prompt, 
-					source_text.replace('\n', " ")
-				);
+                if !res.cli_exe.is_file() {
+                    anyhow::bail!("找不到 llama-cli: {:?}", res.cli_exe);
+                }
+                if !res.text_model.is_file() {
+                    anyhow::bail!("找不到翻译模型: {:?}", res.text_model);
+                }
 
-				// 1. 配置命令：强制静默模式
-				let output = std::process::Command::new(&res.cli_exe)
-					.arg("-m").arg(&res.text_model)
-					.arg("-n").arg("4096")
-					.arg("-c").arg("16384")
-					.arg("-ngl").arg("100") 
-					.arg("--jinja")
-					.arg("--reasoning").arg("off")
-					.arg("--log-disable")
-					.arg("--no-display-prompt") // 不回显 Prompt
-					.arg("--simple-io")         // 禁用 TTY 交互
-					.arg("--single-turn")       // 运行完立即退出
-					.arg("-p").arg(&prompt_text)
-					.stdout(std::process::Stdio::piped()) // 捕获输出
-					.stderr(std::process::Stdio::piped())
-					.output()?;
+                //let prompt_text = format!(
+                //    "{} \"{}\"",
+                //    res.trans_prompt,
+                //    source_text.replace('\n', " ")
+                //);
+								let prompt_text = format!(
+									"{}\n\n{}",
+									res.trans_prompt.trim_end(),
+									source_text.replace('\n', " ")
+								);
 
-				if !output.status.success() {
-					return Err(anyhow::anyhow!("进程异常退出: {:?}", output.status.code()));
-				}
+                let output = std::process::Command::new(&res.cli_exe)
+                    .arg("-m").arg(&res.text_model)
+                    .arg("-n").arg("4096")
+                    .arg("-c").arg("8192")
+                    .arg("--jinja")
+                    .arg("--single-turn")
+                    .arg("--simple-io")                  // 关键：让输出走 stdout
+										.arg("--reasoning").arg("off") 
+                    .arg("-p").arg(&prompt_text)
+                    .stdin(std::process::Stdio::null())
+                    .stdout(std::process::Stdio::piped())
+                    .stderr(std::process::Stdio::piped())
+                    .output()?;
 
-				// 2. 转换输出
-				let raw = String::from_utf8_lossy(&output.stdout);
+                if !output.status.success() {
+                    let err = String::from_utf8_lossy(&output.stderr);
+                    let tail = err.lines().rev().take(15).collect::<Vec<_>>()
+                        .into_iter().rev().collect::<Vec<_>>().join("\n");
+                    anyhow::bail!("llama-cli 退出码 {:?}\n{}", output.status.code(), tail);
+                }
 
-				// 3. 清洗逻辑：由于禁用了 Prompt 回显，这里拿到的应该是纯结果
-				let clean_res = raw.lines()
-					.filter(|line| {
-						let l = line.trim();
-						// 如果行是空的，或者是以下这些垃圾字符开头的，全部剔除
-						!l.is_empty() && 
-							!l.starts_with(">") &&
-							!l.starts_with("Loading model") &&
-							!l.starts_with("build      :") &&
-							!l.starts_with("model      :") &&
-							!l.starts_with("modalities :") &&
-							!l.contains("available commands:") &&
-							!l.starts_with("/") &&             // 过滤掉 /exit, /regen, /clear 等指令行
-							!l.contains("Ctrl+C") &&           // 过滤掉包含 Ctrl+C 的那行帮助
-							!l.starts_with("[") &&             // 过滤性能统计 [ Prompt: ... ]
-							!l.contains("Exiting")             // 过滤退出提示
-					})
-				.collect::<Vec<_>>()
-					.join("\n")
-					.trim()
-					.to_string();
+                let raw = String::from_utf8_lossy(&output.stdout);
+                let lines: Vec<&str> = raw.lines().collect();
 
-				if clean_res.is_empty() {
-					return Err(anyhow::anyhow!("内容提取失败。Raw: {}", raw));
-				}
+                // 起点：第一行以 "> " 开头的 prompt 回显之后
+                let start = lines.iter().position(|l| l.starts_with("> ")).map(|i| i + 1);
+                // 终点：最后一行 "[ Prompt:" 统计行之前
+                let end = lines.iter().rposition(|l| l.trim_start().starts_with("[ Prompt:"));
 
-				Ok(clean_res)
-			})();
+                let clean_res = match (start, end) {
+                    (Some(s), Some(e)) if s <= e => lines[s..e].join("\n").trim().to_string(),
+                    (Some(s), None) => lines[s..].iter()
+                        .filter(|l| !l.contains("Exiting"))
+                        .copied().collect::<Vec<_>>().join("\n").trim().to_string(),
+                    _ => String::new(),
+                };
 
+                if clean_res.is_empty() {
+                    anyhow::bail!("内容提取失败。Raw stdout:\n{}", raw);
+                }
+                Ok(clean_res)
+            })();
 
-			// 4. 更新 UI 状态
-			if let (Ok(mut c), Ok(mut s)) = (trans_ptr.lock(), state_ptr.lock()) {
-				match result {
-					Ok(text) => { *c = text; *s = OcrState::Success; }
-					Err(e) => { *c = format!("❌ 错误: {}", e); *s = OcrState::Failure; }
-				}
-			}
-			ctx.request_repaint();
-		});
-	}
+            if let (Ok(mut c), Ok(mut s)) = (trans_ptr.lock(), state_ptr.lock()) {
+                match result {
+                    Ok(text) => { *c = text; *s = OcrState::Success; }
+                    Err(e) => { *c = format!("❌ 错误: {}", e); *s = OcrState::Failure; }
+                }
+            }
+            ctx.request_repaint();
+        });
+    }
 }
-
 //压缩图片
 fn preprocess_image(input_path: &str) -> anyhow::Result<String> {
     let img = image::open(input_path)?;
@@ -1417,28 +1440,36 @@ fn save_history_to_db_static(
     Ok(())
 }
 impl OCRTApp {
-    fn load_history(&mut self) {
-        if let Ok(conn) = Connection::open(&self.db_path) {
-            let mut stmt = conn.prepare(
-                "SELECT id, time, ocr_text, image_data FROM ocr_history ORDER BY id DESC LIMIT 2000"
-            ).unwrap();
+    // 在后台线程里读库，不阻塞 UI
+    fn query_history(db_path: &std::path::Path) -> Vec<HistoryEntry> {
+        let Ok(conn) = Connection::open(db_path) else { return vec![] };
+        let Ok(mut stmt) = conn.prepare(
+            "SELECT id, time, ocr_text, image_data FROM ocr_history ORDER BY id DESC LIMIT 2000"
+        ) else { return vec![] };
 
-            let rows = stmt.query_map([], |row| {
-                Ok(HistoryEntry {
-                    id: row.get(0)?,
-                    time: row.get(1)?,
-                    ocr_text: row.get(2)?,
-                    image_data: row.get(3)?,
-                })
-            }).unwrap();
+        let Ok(rows) = stmt.query_map([], |row| {
+            let blob: Vec<u8> = row.get(3)?;
+            Ok(HistoryEntry {
+                id: row.get(0)?,
+                time: row.get(1)?,
+                ocr_text: row.get(2)?,
+                image_data: blob.into(), // Vec<u8> -> Arc<[u8]>，之后 clone 只增加引用计数
+            })
+        }) else { return vec![] };
 
-            self.history_items.clear();
-            for row in rows {
-                if let Ok(entry) = row {
-                    self.history_items.push(entry);
-                }
-            }
-        }
+        let items: Vec<HistoryEntry> = rows.filter_map(|r| r.ok()).collect();
+        items
+    }
+
+    fn load_history_async(&mut self, ctx: &egui::Context) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.history_rx = Some(rx);
+        let db = self.db_path.clone();
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(Self::query_history(&db));
+            ctx.request_repaint();
+        });
     }
 }
 impl OCRTApp {
@@ -1461,6 +1492,7 @@ impl OCRTApp {
 
 		// 2. 历史记录主面板
 		if !self.show_history { return; }
+		let loading = self.history_rx.is_some();
 		let window_size = egui::vec2(700.0, 400.0);
 		let title = format!("📜 历史记录 ({})", self.history_items.len());
 		egui::Window::new(title)
@@ -1469,7 +1501,11 @@ impl OCRTApp {
 			.resizable(false)
 			.show(ctx, |ui| {
 				if self.history_items.is_empty() {
-					ui.label("暂无历史记录");
+					if loading {
+						ui.label("加载中…");
+					} else {
+						ui.label("暂无历史记录");
+					}
 				}
 
 				// 严格定义总行高（包含卡片和卡片下方的间距）
